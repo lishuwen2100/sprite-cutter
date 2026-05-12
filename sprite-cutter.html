@@ -1,0 +1,614 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Sprite 切图器 - 网格自由调整 + 距离显示</title>
+  <style>
+    * { margin:0; padding:0; box-sizing:border-box; }
+    body { font-family: -apple-system, sans-serif; background: #1e1e1e; color: #eee; display: flex; flex-direction: column; height: 100vh; }
+    #toolbar {
+      padding: 10px 16px;
+      background: #2a2a2a;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    button, input[type="file"] { padding: 8px 14px; border: none; border-radius: 6px; cursor: pointer; font-size: 14px; background: #444; color: #eee; }
+    button.primary { background: #007aff; }
+    button:hover { opacity: 0.8; }
+    .mode-group { display: flex; gap: 2px; background: #333; border-radius: 6px; padding: 2px; }
+    .mode-group button { background: transparent; border-radius: 4px; }
+    .mode-group button.active { background: #007aff; }
+    .num-input { width: 50px; padding: 6px; border-radius: 4px; border: 1px solid #666; background: #222; color: #eee; text-align: center; }
+    label { color: #aaa; font-size: 13px; }
+    #canvas-container {
+      flex: 1;
+      overflow: hidden;
+      background: #111;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      position: relative;
+    }
+    canvas { display: block; }
+    #info { color: #aaa; font-size: 13px; margin-left: auto; }
+    .hidden { display: none; }
+  </style>
+</head>
+<body>
+<div id="toolbar">
+  <input type="file" id="fileInput" accept="image/*">
+  <button id="zoomInBtn" title="放大">🔍+</button>
+  <button id="zoomOutBtn" title="缩小">🔍-</button>
+  <button id="resetViewBtn">↺ 适应</button>
+  <span>|</span>
+  
+  <div class="mode-group" id="modeGroup">
+    <button id="freeModeBtn">✚ 自由</button>
+    <button id="fixedModeBtn">📐 固定</button>
+    <button id="gridModeBtn" class="active">📊 网格</button>
+  </div>
+  
+  <div id="gridParams">
+    <label>列:</label><input type="number" id="gridCols" class="num-input" value="4" min="1" max="20" step="1">
+    <label>行:</label><input type="number" id="gridRows" class="num-input" value="2" min="1" max="20" step="1">
+    <button id="genGridBtn">↻ 生成网格</button>
+  </div>
+  <div id="fixedParams" class="hidden">
+    <label>宽:</label><input type="number" id="fixedW" class="num-input" value="64" min="10" step="1">
+    <label>高:</label><input type="number" id="fixedH" class="num-input" value="64" min="10" step="1">
+  </div>
+  
+  <span>|</span>
+  <button id="deleteSelectedBtn">🗑 删除选中</button>
+  <button id="exportBtn" class="primary">⬇️ 导出全部</button>
+  <span id="info"></span>
+</div>
+<div id="canvas-container">
+  <canvas id="canvas"></canvas>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+<script>
+(function() {
+  const canvas = document.getElementById('canvas');
+  const ctx = canvas.getContext('2d');
+  const container = document.getElementById('canvas-container');
+
+  let img = null;
+  let scale = 1;
+  let offsetX = 0, offsetY = 0;
+
+  let currentMode = 'grid';
+  let rects = [];
+  let selectedRectIndex = -1;
+
+  // 网格数据
+  let gridCols = 4;
+  let gridRows = 2;
+  let vLines = []; // 垂直分割线的x坐标（原图坐标）
+  let hLines = []; // 水平分割线的y坐标
+
+  let dragging = null;
+
+  // DOM 元素
+  const fileInput = document.getElementById('fileInput');
+  const freeBtn = document.getElementById('freeModeBtn');
+  const fixedBtn = document.getElementById('fixedModeBtn');
+  const gridBtn = document.getElementById('gridModeBtn');
+  const gridParams = document.getElementById('gridParams');
+  const fixedParams = document.getElementById('fixedParams');
+  const gridColsInput = document.getElementById('gridCols');
+  const gridRowsInput = document.getElementById('gridRows');
+  const genGridBtn = document.getElementById('genGridBtn');
+  const fixedWInput = document.getElementById('fixedW');
+  const fixedHInput = document.getElementById('fixedH');
+  const deleteBtn = document.getElementById('deleteSelectedBtn');
+  const exportBtn = document.getElementById('exportBtn');
+  const infoSpan = document.getElementById('info');
+
+  // 模式切换
+  function switchMode(mode) {
+    currentMode = mode;
+    rects = [];
+    selectedRectIndex = -1;
+    dragging = null;
+
+    freeBtn.classList.remove('active');
+    fixedBtn.classList.remove('active');
+    gridBtn.classList.remove('active');
+    if (mode === 'free') freeBtn.classList.add('active');
+    if (mode === 'fixed') fixedBtn.classList.add('active');
+    if (mode === 'grid') gridBtn.classList.add('active');
+
+    gridParams.classList.toggle('hidden', mode !== 'grid');
+    fixedParams.classList.toggle('hidden', mode !== 'fixed');
+
+    if (mode === 'grid') generateGrid();
+    draw();
+  }
+
+  freeBtn.addEventListener('click', () => switchMode('free'));
+  fixedBtn.addEventListener('click', () => switchMode('fixed'));
+  gridBtn.addEventListener('click', () => switchMode('grid'));
+
+  // 图片加载
+  fileInput.addEventListener('change', e => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = ev => {
+      const image = new Image();
+      image.onload = () => {
+        img = image;
+        rects = [];
+        selectedRectIndex = -1;
+        resetView();
+        if (currentMode === 'grid') generateGrid();
+        draw();
+      };
+      image.src = ev.target.result;
+    };
+    reader.readAsDataURL(file);
+  });
+
+  container.addEventListener('dragover', e => e.preventDefault());
+  container.addEventListener('drop', e => {
+    e.preventDefault();
+    const file = e.dataTransfer.files[0];
+    if (file && file.type.startsWith('image/')) {
+      const dt = new DataTransfer();
+      dt.items.add(file);
+      fileInput.files = dt.files;
+      fileInput.dispatchEvent(new Event('change'));
+    }
+  });
+
+  // 视图变换
+  function resetView() {
+    if (!img) return;
+    const cw = container.clientWidth;
+    const ch = container.clientHeight;
+    scale = Math.min(cw / img.width, ch / img.height, 0.95);
+    offsetX = (cw - img.width * scale) / 2;
+    offsetY = (ch - img.height * scale) / 2;
+  }
+
+  function canvasToImage(cx, cy) {
+    return {
+      x: (cx - offsetX) / scale,
+      y: (cy - offsetY) / scale
+    };
+  }
+
+  function imageToCanvas(ix, iy) {
+    return {
+      x: ix * scale + offsetX,
+      y: iy * scale + offsetY
+    };
+  }
+
+  // 网格生成
+  function generateGrid() {
+    if (!img) return;
+    gridCols = parseInt(gridColsInput.value) || 4;
+    gridRows = parseInt(gridRowsInput.value) || 2;
+    gridCols = Math.max(1, Math.min(gridCols, 20));
+    gridRows = Math.max(1, Math.min(gridRows, 20));
+    gridColsInput.value = gridCols;
+    gridRowsInput.value = gridRows;
+
+    vLines = [];
+    for (let i = 1; i < gridCols; i++) {
+      vLines.push((img.width / gridCols) * i);
+    }
+    hLines = [];
+    for (let i = 1; i < gridRows; i++) {
+      hLines.push((img.height / gridRows) * i);
+    }
+    draw();
+  }
+
+  genGridBtn.addEventListener('click', generateGrid);
+  gridColsInput.addEventListener('change', generateGrid);
+  gridRowsInput.addEventListener('change', generateGrid);
+
+  // 碰撞检测
+  function hitTestRect(imgX, imgY) {
+    for (let i = rects.length - 1; i >= 0; i--) {
+      const r = rects[i];
+      if (imgX >= r.x && imgX <= r.x + r.w &&
+          imgY >= r.y && imgY <= r.y + r.h) {
+        return i;
+      }
+    }
+    return -1;
+  }
+
+  const LINE_HIT = 12;
+  function hitTestGridLine(imgX, imgY) {
+    if (currentMode !== 'grid') return null;
+    for (let i = 0; i < vLines.length; i++) {
+      if (Math.abs(imgX - vLines[i]) <= LINE_HIT) {
+        return { type: 'vline', index: i };
+      }
+    }
+    for (let i = 0; i < hLines.length; i++) {
+      if (Math.abs(imgY - hLines[i]) <= LINE_HIT) {
+        return { type: 'hline', index: i };
+      }
+    }
+    return null;
+  }
+
+  // —— 绘制 ——
+  function draw() {
+    if (!img) return;
+    canvas.width = container.clientWidth;
+    canvas.height = container.clientHeight;
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    // 绘制图片
+    ctx.save();
+    ctx.translate(offsetX, offsetY);
+    ctx.scale(scale, scale);
+    ctx.drawImage(img, 0, 0);
+    ctx.restore();
+
+    // 自由/固定模式的矩形
+    if (currentMode === 'free' || currentMode === 'fixed') {
+      rects.forEach((r, idx) => {
+        const { x, y } = imageToCanvas(r.x, r.y);
+        const w = r.w * scale;
+        const h = r.h * scale;
+        ctx.strokeStyle = idx === selectedRectIndex ? '#ffaa00' : '#00ccff';
+        ctx.lineWidth = 2;
+        ctx.strokeRect(x, y, w, h);
+        ctx.fillStyle = '#fff';
+        ctx.fillText(idx, x + 4, y + 16);
+      });
+      if (currentMode === 'free' && dragging && dragging.type === 'freeDrawing') {
+        const r = dragging.rect;
+        const { x, y } = imageToCanvas(r.x, r.y);
+        ctx.strokeStyle = '#ff4488';
+        ctx.lineWidth = 2;
+        ctx.setLineDash([6]);
+        ctx.strokeRect(x, y, r.w * scale, r.h * scale);
+        ctx.setLineDash([]);
+      }
+    }
+
+    // 网格模式
+    if (currentMode === 'grid') {
+      // 半透明单元格
+      const allX = [0, ...vLines, img.width];
+      const allY = [0, ...hLines, img.height];
+      ctx.save();
+      ctx.globalAlpha = 0.12;
+      for (let r = 0; r < allY.length - 1; r++) {
+        for (let c = 0; c < allX.length - 1; c++) {
+          const x = allX[c], y = allY[r], w = allX[c+1] - x, h = allY[r+1] - y;
+          const cx = x * scale + offsetX, cy = y * scale + offsetY;
+          ctx.fillStyle = (r + c) % 2 === 0 ? '#00ccff' : '#ffaa00';
+          ctx.fillRect(cx, cy, w * scale, h * scale);
+        }
+      }
+      ctx.globalAlpha = 1;
+
+      // 分割线
+      ctx.strokeStyle = '#00aaff';
+      ctx.lineWidth = 2;
+      vLines.forEach(lx => {
+        const canvasX = lx * scale + offsetX;
+        ctx.beginPath();
+        ctx.moveTo(canvasX, offsetY);
+        ctx.lineTo(canvasX, offsetY + img.height * scale);
+        ctx.stroke();
+      });
+      ctx.strokeStyle = '#ff8800';
+      hLines.forEach(ly => {
+        const canvasY = ly * scale + offsetY;
+        ctx.beginPath();
+        ctx.moveTo(offsetX, canvasY);
+        ctx.lineTo(offsetX + img.width * scale, canvasY);
+        ctx.stroke();
+      });
+
+      // 拖拽手柄点
+      vLines.forEach(lx => {
+        const midY = img.height / 2;
+        const cx = lx * scale + offsetX;
+        const cy = midY * scale + offsetY;
+        ctx.fillStyle = '#00aaff';
+        ctx.beginPath();
+        ctx.arc(cx, cy, 5, 0, Math.PI*2);
+        ctx.fill();
+      });
+      hLines.forEach(ly => {
+        const midX = img.width / 2;
+        const cx = midX * scale + offsetX;
+        const cy = ly * scale + offsetY;
+        ctx.fillStyle = '#ff8800';
+        ctx.beginPath();
+        ctx.arc(cx, cy, 5, 0, Math.PI*2);
+        ctx.fill();
+      });
+      ctx.restore(); // 恢复坐标系
+
+      // ---- 距离标签（在 canvas 坐标绘制）----
+      ctx.font = 'bold 12px -apple-system, sans-serif';
+      ctx.textBaseline = 'middle';
+
+      // 竖线距离
+      vLines.forEach((lx, i) => {
+        const left = i === 0 ? 0 : vLines[i - 1];
+        const dist = Math.round(lx - left);
+        const canvasX = lx * scale + offsetX;
+        // 标签放在竖线右侧，垂直位置在图片顶部附近（但保证可见）
+        const labelY = Math.max(15, offsetY + 20);
+        const text = dist + 'px';
+        const textWidth = ctx.measureText(text).width;
+        const padding = 4;
+        // 半透明背景
+        ctx.fillStyle = 'rgba(0,0,0,0.6)';
+        ctx.fillRect(canvasX + 6, labelY - 10, textWidth + padding * 2, 20);
+        ctx.fillStyle = '#fff';
+        ctx.fillText(text, canvasX + 6 + padding, labelY);
+      });
+
+      // 横线距离
+      hLines.forEach((ly, i) => {
+        const top = i === 0 ? 0 : hLines[i - 1];
+        const dist = Math.round(ly - top);
+        const canvasY = ly * scale + offsetY;
+        const labelX = Math.max(10, offsetX + 20);
+        const text = dist + 'px';
+        const textWidth = ctx.measureText(text).width;
+        const padding = 4;
+        ctx.fillStyle = 'rgba(0,0,0,0.6)';
+        ctx.fillRect(labelX, canvasY + 6, textWidth + padding * 2, 20);
+        ctx.fillStyle = '#fff';
+        ctx.fillText(text, labelX + padding, canvasY + 6 + 10);
+      });
+    }
+
+    updateInfo();
+  }
+
+  function updateInfo() {
+    if (!img) {
+      infoSpan.textContent = '请加载图片';
+      return;
+    }
+    if (currentMode === 'grid') {
+      const cells = (vLines.length + 1) * (hLines.length + 1);
+      infoSpan.textContent = `缩放: ${Math.round(scale*100)}% | 网格: ${gridCols}×${gridRows} → ${cells} 个单元格`;
+    } else {
+      infoSpan.textContent = `缩放: ${Math.round(scale*100)}% | 矩形: ${rects.length} 个 | 模式: ${currentMode}`;
+    }
+  }
+
+  // 鼠标事件
+  canvas.addEventListener('mousedown', e => {
+    const rect = canvas.getBoundingClientRect();
+    const mx = e.clientX - rect.left;
+    const my = e.clientY - rect.top;
+    const imgPt = canvasToImage(mx, my);
+
+    if (currentMode === 'free') {
+      const hitIdx = hitTestRect(imgPt.x, imgPt.y);
+      if (hitIdx >= 0) {
+        selectedRectIndex = hitIdx;
+        dragging = { type: 'rect', index: hitIdx, startMouse: { x: mx, y: my }, startPos: { x: rects[hitIdx].x, y: rects[hitIdx].y } };
+      } else {
+        dragging = { type: 'freeDrawing', rect: { x: imgPt.x, y: imgPt.y, w: 0, h: 0 } };
+        selectedRectIndex = -1;
+      }
+      draw();
+    } else if (currentMode === 'fixed') {
+      const hitIdx = hitTestRect(imgPt.x, imgPt.y);
+      if (hitIdx >= 0) {
+        selectedRectIndex = hitIdx;
+        dragging = { type: 'rect', index: hitIdx, startMouse: { x: mx, y: my }, startPos: { x: rects[hitIdx].x, y: rects[hitIdx].y } };
+      } else {
+        dragging = { type: 'fixedClick', point: imgPt };
+      }
+      draw();
+    } else if (currentMode === 'grid') {
+      const lineHit = hitTestGridLine(imgPt.x, imgPt.y);
+      if (lineHit) {
+        dragging = {
+          type: lineHit.type,
+          index: lineHit.index,
+          startMouse: { x: mx, y: my },
+          startValue: lineHit.type === 'vline' ? vLines[lineHit.index] : hLines[lineHit.index]
+        };
+        canvas.style.cursor = lineHit.type === 'vline' ? 'col-resize' : 'row-resize';
+      } else {
+        dragging = { type: 'img', startOffset: { x: offsetX, y: offsetY }, startMouse: { x: mx, y: my } };
+      }
+      draw();
+    }
+  });
+
+  canvas.addEventListener('mousemove', e => {
+    const rect = canvas.getBoundingClientRect();
+    const mx = e.clientX - rect.left;
+    const my = e.clientY - rect.top;
+    const imgPt = canvasToImage(mx, my);
+
+    if (!dragging) {
+      if (currentMode === 'grid') {
+        const hit = hitTestGridLine(imgPt.x, imgPt.y);
+        canvas.style.cursor = hit ? (hit.type === 'vline' ? 'col-resize' : 'row-resize') : 'default';
+      } else {
+        canvas.style.cursor = currentMode === 'free' ? 'crosshair' : 'cell';
+      }
+      return;
+    }
+
+    if (dragging.type === 'freeDrawing') {
+      dragging.rect.w = imgPt.x - dragging.rect.x;
+      dragging.rect.h = imgPt.y - dragging.rect.y;
+      draw();
+    } else if (dragging.type === 'rect') {
+      const dx = (mx - dragging.startMouse.x) / scale;
+      const dy = (my - dragging.startMouse.y) / scale;
+      rects[dragging.index].x = dragging.startPos.x + dx;
+      rects[dragging.index].y = dragging.startPos.y + dy;
+      draw();
+    } else if (dragging.type === 'vline') {
+      const prev = dragging.index > 0 ? vLines[dragging.index - 1] : 0;
+      const next = dragging.index < vLines.length - 1 ? vLines[dragging.index + 1] : img.width;
+      const newX = Math.min(Math.max(prev + 5, imgPt.x), next - 5);
+      vLines[dragging.index] = newX;
+      draw();
+    } else if (dragging.type === 'hline') {
+      const prev = dragging.index > 0 ? hLines[dragging.index - 1] : 0;
+      const next = dragging.index < hLines.length - 1 ? hLines[dragging.index + 1] : img.height;
+      const newY = Math.min(Math.max(prev + 5, imgPt.y), next - 5);
+      hLines[dragging.index] = newY;
+      draw();
+    } else if (dragging.type === 'img') {
+      offsetX = dragging.startOffset.x + (mx - dragging.startMouse.x);
+      offsetY = dragging.startOffset.y + (my - dragging.startMouse.y);
+      draw();
+    }
+  });
+
+  canvas.addEventListener('mouseup', e => {
+    if (!dragging) return;
+    if (dragging.type === 'freeDrawing') {
+      let { x, y, w, h } = dragging.rect;
+      if (w < 0) { x += w; w = -w; }
+      if (h < 0) { y += h; h = -h; }
+      if (w > 5 && h > 5) {
+        rects.push({ x, y, w, h });
+        selectedRectIndex = rects.length - 1;
+      }
+    } else if (dragging.type === 'fixedClick') {
+      const w = parseInt(fixedWInput.value) || 64;
+      const h = parseInt(fixedHInput.value) || 64;
+      rects.push({ x: dragging.point.x - w/2, y: dragging.point.y - h/2, w, h });
+      selectedRectIndex = rects.length - 1;
+    }
+    dragging = null;
+    canvas.style.cursor = currentMode === 'free' ? 'crosshair' : (currentMode === 'fixed' ? 'cell' : 'default');
+    draw();
+  });
+
+  window.addEventListener('mouseup', () => {
+    if (dragging) {
+      if (dragging.type === 'freeDrawing') {
+        let { x, y, w, h } = dragging.rect;
+        if (w < 0) { x += w; w = -w; }
+        if (h < 0) { y += h; h = -h; }
+        if (w > 5 && h > 5) rects.push({ x, y, w, h });
+      }
+      dragging = null;
+      draw();
+    }
+  });
+
+  // 缩放/视图
+  document.getElementById('zoomInBtn').addEventListener('click', () => { scale *= 1.2; draw(); });
+  document.getElementById('zoomOutBtn').addEventListener('click', () => { scale /= 1.2; draw(); });
+  document.getElementById('resetViewBtn').addEventListener('click', () => { resetView(); draw(); });
+
+  // 删除
+  deleteBtn.addEventListener('click', () => {
+    if (selectedRectIndex >= 0 && (currentMode === 'free' || currentMode === 'fixed')) {
+      rects.splice(selectedRectIndex, 1);
+      selectedRectIndex = -1;
+      draw();
+    }
+  });
+  window.addEventListener('keydown', e => {
+    if ((e.key === 'Delete' || e.key === 'Backspace') && document.activeElement === document.body) {
+      e.preventDefault();
+      if (selectedRectIndex >= 0 && (currentMode === 'free' || currentMode === 'fixed')) {
+        rects.splice(selectedRectIndex, 1);
+        selectedRectIndex = -1;
+        draw();
+      }
+    }
+  });
+
+  // 导出
+  exportBtn.addEventListener('click', async () => {
+    if (!img) { alert('请先加载图片'); return; }
+
+    if (currentMode === 'grid') {
+      const allX = [0, ...vLines, img.width];
+      const allY = [0, ...hLines, img.height];
+      const cells = [];
+      for (let r = 0; r < allY.length - 1; r++) {
+        for (let c = 0; c < allX.length - 1; c++) {
+          cells.push({
+            x: Math.round(allX[c]),
+            y: Math.round(allY[r]),
+            w: Math.round(allX[c+1] - allX[c]),
+            h: Math.round(allY[r+1] - allY[r])
+          });
+        }
+      }
+      if (cells.length === 0) { alert('无单元格可导出'); return; }
+
+      const zip = new JSZip();
+      for (let i = 0; i < cells.length; i++) {
+        const ce = cells[i];
+        if (ce.w <= 0 || ce.h <= 0) continue;
+        const offCanvas = document.createElement('canvas');
+        offCanvas.width = ce.w;
+        offCanvas.height = ce.h;
+        const offCtx = offCanvas.getContext('2d');
+        offCtx.drawImage(img, ce.x, ce.y, ce.w, ce.h, 0, 0, ce.w, ce.h);
+        const blob = await new Promise(resolve => offCanvas.toBlob(resolve, 'image/png'));
+        zip.file(`frame_${String(i).padStart(2, '0')}.png`, blob);
+      }
+      const content = await zip.generateAsync({ type: 'blob' });
+      const url = URL.createObjectURL(content);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'grid_frames.zip';
+      a.click();
+      URL.revokeObjectURL(url);
+    } else {
+      if (rects.length === 0) { alert('请先添加选框'); return; }
+      const zip = new JSZip();
+      for (let i = 0; i < rects.length; i++) {
+        const r = rects[i];
+        const sx = Math.max(0, Math.min(r.x, img.width));
+        const sy = Math.max(0, Math.min(r.y, img.height));
+        const sw = Math.min(r.w, img.width - sx);
+        const sh = Math.min(r.h, img.height - sy);
+        if (sw <= 0 || sh <= 0) continue;
+        const offCanvas = document.createElement('canvas');
+        offCanvas.width = sw;
+        offCanvas.height = sh;
+        const offCtx = offCanvas.getContext('2d');
+        offCtx.drawImage(img, sx, sy, sw, sh, 0, 0, sw, sh);
+        const blob = await new Promise(resolve => offCanvas.toBlob(resolve, 'image/png'));
+        zip.file(`frame_${String(i).padStart(2, '0')}.png`, blob);
+      }
+      const content = await zip.generateAsync({ type: 'blob' });
+      const url = URL.createObjectURL(content);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'free_frames.zip';
+      a.click();
+      URL.revokeObjectURL(url);
+    }
+  });
+
+  window.addEventListener('resize', () => { if (img) draw(); });
+
+  // 启动
+  resetView();
+  switchMode('grid');
+})();
+</script>
+</body>
+</html>
